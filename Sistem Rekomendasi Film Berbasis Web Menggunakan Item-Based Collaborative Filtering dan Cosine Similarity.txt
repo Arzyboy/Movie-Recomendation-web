@@ -1,0 +1,14 @@
+pip install flask pandas numpy scikit-learn requests
+py app.py
+
+bab 2 
+tambahin teori HTML
+tambahin teori struktur navigasi 
+tambahin teori pembuatan web
+tambahin juga tentang teori website
+tambahin juga tentang teori testing
+
+web 
+buat genrenya menjadi pengelompokan agar data terbaca
+cari tentang synopsis film 
+cari juga poster film
