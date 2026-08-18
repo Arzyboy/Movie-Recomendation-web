@@ -3,9 +3,14 @@ import pandas as pd
 import numpy as np
 from scipy.sparse import csr_matrix
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import MultiLabelBinarizer
 
 
 class MovieRecommender:
+    GENRE_WEIGHT = 0.6
+    CF_WEIGHT = 0.4
+    MIN_GENRE_SIM = 0.3
+
     def __init__(self, movies_path, ratings_path, tags_path, poster_folder, n_movies=1000):
         self.movies_path = movies_path
         self.ratings_path = ratings_path
@@ -20,6 +25,9 @@ class MovieRecommender:
         self.movie_mapper = {}
         self.movie_inv_mapper = {}
         self.item_similarity = None
+
+        self.genre_mapper = {}
+        self.genre_similarity = None
 
         self._load_data()
         self._build_similarity()
@@ -50,13 +58,26 @@ class MovieRecommender:
         self.movies_df["avg_rating"] = self.movies_df["avg_rating"].fillna(0).round(1)
         self.movies_df["rating_count"] = self.movies_df["rating_count"].fillna(0).astype(int)
         self.movies_df["genres"] = self.movies_df["genres"].fillna("(no genres listed)")
+        self.movies_df["genre_list"] = self.movies_df["genres"].apply(
+            lambda g: [] if g == "(no genres listed)" else g.split("|")
+        )
 
     def _build_similarity(self):
+        self._build_genre_similarity()
+
         if self.ratings_df.empty:
             self.item_similarity = np.array([[]])
             return
 
-        user_movie_matrix = self.ratings_df.pivot_table(
+        # Adjusted cosine similarity: rating tiap user dikurangi rata-rata
+        # rating user tsb dulu, supaya bias "user royal kasih nilai tinggi"
+        # vs "user pelit kasih nilai" tidak mendistorsi kemiripan antar film
+        # (Sarwar et al., 2001).
+        user_means = self.ratings_df.groupby("userId")["rating"].mean()
+        adjusted_ratings = self.ratings_df.copy()
+        adjusted_ratings["rating"] = adjusted_ratings["rating"] - adjusted_ratings["userId"].map(user_means)
+
+        user_movie_matrix = adjusted_ratings.pivot_table(
             index="userId",
             columns="movieId",
             values="rating",
@@ -70,6 +91,18 @@ class MovieRecommender:
         sparse_matrix = csr_matrix(user_movie_matrix.values)
         item_user_matrix = sparse_matrix.T
         self.item_similarity = cosine_similarity(item_user_matrix)
+
+    def _build_genre_similarity(self):
+        """Cosine similarity antar film berdasarkan genre (one-hot). Selalu
+        bisa dihitung untuk seluruh film di katalog, walau film itu belum
+        pernah dirating siapa pun -- ini yang jadi fallback saat data CF
+        kosong/terlalu tipis."""
+        mlb = MultiLabelBinarizer()
+        genre_matrix = mlb.fit_transform(self.movies_df["genre_list"])
+        self.genre_similarity = cosine_similarity(genre_matrix)
+        self.genre_mapper = {
+            movie_id: pos for pos, movie_id in enumerate(self.movies_df["movieId"])
+        }
 
     def get_poster_url(self, movie_id):
         extensions = [".jpg", ".jpeg", ".png", ".webp"]
@@ -121,21 +154,39 @@ class MovieRecommender:
         return df.to_dict(orient="records")
 
     def get_similar_movies(self, movie_id, n=10):
-        if movie_id not in self.movie_mapper:
+        if movie_id not in self.genre_mapper:
             return []
 
-        movie_index = self.movie_mapper[movie_id]
-        similarity_scores = list(enumerate(self.item_similarity[movie_index]))
-        similarity_scores = sorted(similarity_scores, key=lambda x: x[1], reverse=True)
+        target_pos = self.genre_mapper[movie_id]
+        target_cf_idx = self.movie_mapper.get(movie_id)
+
+        candidates = []
+        for other_id, other_pos in self.genre_mapper.items():
+            if other_id == movie_id:
+                continue
+
+            genre_sim = self.genre_similarity[target_pos][other_pos]
+            if genre_sim < self.MIN_GENRE_SIM:
+                continue
+
+            cf_sim = 0.0
+            other_cf_idx = self.movie_mapper.get(other_id)
+            if target_cf_idx is not None and other_cf_idx is not None:
+                cf_sim = self.item_similarity[target_cf_idx][other_cf_idx]
+
+            final_score = self.GENRE_WEIGHT * genre_sim + self.CF_WEIGHT * cf_sim
+            candidates.append((other_id, final_score, genre_sim, cf_sim))
+
+        candidates.sort(key=lambda x: x[1], reverse=True)
 
         similar_movies = []
-        for idx, score in similarity_scores[1:n + 1]:
-            similar_movie_id = self.movie_inv_mapper.get(idx)
-            if similar_movie_id is not None:
-                similar_movies.append({
-                    "movieId": int(similar_movie_id),
-                    "similarity": float(round(score, 4))
-                })
+        for other_id, final_score, genre_sim, cf_sim in candidates[:n]:
+            similar_movies.append({
+                "movieId": int(other_id),
+                "similarity": float(round(final_score, 4)),
+                "genre_similarity": float(round(genre_sim, 4)),
+                "cf_similarity": float(round(cf_sim, 4))
+            })
 
         return similar_movies
 
